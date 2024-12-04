@@ -1,0 +1,263 @@
+// Cloud mask for Landsat 8
+function maskL8sr(col) {
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  var cloudShadowBitMask = (1 << 3);
+  var cloudsBitMask = (1 << 5);
+  
+  // Get the pixel QA band.
+  var qa = col.select('QA_PIXEL');
+  
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+               .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  
+  return col.updateMask(mask);
+}
+
+// Define the area of interest (AOI) for Cebu City
+var cebuCity = ee.FeatureCollection('projects/uhi-dynamics/assets/phl_admbnda_adm3_psa_namria_20231106')
+    .filter(ee.Filter.eq('ADM3_EN', 'Cebu City (Capital)'));  
+
+// Load Landsat 8 Image Collection and filter by date and bounds
+var dataset = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterDate('2014-03-01', '2014-04-30')
+  .filterBounds(cebuCity)
+  .map(applyScaleFactors)
+  .map(maskL8sr)
+  .median();
+
+// Function to apply scaling factors
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true)
+              .addBands(thermalBands, null, true);
+}
+
+// Create a binary mask based on the AOI geometry
+var aoiMask = ee.Image.constant(1).clip(cebuCity);  // Create a binary mask inside the AOI
+
+// Mask the dataset to only show the AOI region
+dataset = dataset.updateMask(aoiMask);
+
+// Set visualization parameters for True Color
+var visualization = {
+  bands: ['SR_B4', 'SR_B3', 'SR_B2'],
+  min: 0.0,
+  max: 0.3,
+};
+
+// ***********************************************************************
+// Add AOI Polygon Layer (Boundary)
+// ***********************************************************************
+var aoiPolygon = cebuCity.style({color: 'red', fillColor: '00000000', width: 2});
+Map.addLayer(aoiPolygon, {}, 'AOI Polygon');
+
+// Add the dataset layer to the map
+Map.addLayer(dataset, visualization, 'True Color (432)', false);
+
+// Center the map on the AOI (Cebu City)
+Map.centerObject(cebuCity, 10);
+
+// NDVI Calculation
+var ndvi = dataset.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+Map.addLayer(ndvi, {min: -1, max: 1, palette: ['blue', 'white', 'green']}, 'NDVI', false);
+
+// NDBI Calculation (placed below NDVI)
+var ndbi = dataset.normalizedDifference(['SR_B6', 'SR_B5']).rename('NDBI');
+Map.addLayer(ndbi, {min: -1, max: 1, palette: ['blue', 'white', 'red']}, 'NDBI', false);
+
+// NDVI Statistics
+var ndvi_min = ee.Number(ndvi.reduceRegion({
+  reducer: ee.Reducer.min(),
+  geometry: cebuCity,
+  scale: 30,
+  maxPixels: 1e9
+}).values().get(0));
+
+var ndvi_max = ee.Number(ndvi.reduceRegion({
+  reducer: ee.Reducer.max(),
+  geometry: cebuCity,
+  scale: 30,
+  maxPixels: 1e9
+}).values().get(0));
+
+print('NDVI Min:', ndvi_min);
+print('NDVI Max:', ndvi_max);
+
+// NDBI Statistics
+var ndbi_min = ee.Number(ndbi.reduceRegion({
+  reducer: ee.Reducer.min(),
+  geometry: cebuCity,
+  scale: 30,
+  maxPixels: 1e9
+}).values().get(0));
+
+var ndbi_max = ee.Number(ndbi.reduceRegion({
+  reducer: ee.Reducer.max(),
+  geometry: cebuCity,
+  scale: 30,
+  maxPixels: 1e9
+}).values().get(0));
+
+print('NDBI Min:', ndbi_min);
+print('NDBI Max:', ndbi_max);
+
+// Fraction of Vegetation (FV)
+var fv = (ndvi.subtract(ndvi_min).divide(ndvi_max.subtract(ndvi_min))).pow(ee.Number(2))
+      .rename('FV');
+
+// Emissivity (EM)
+var em = fv.multiply(ee.Number(0.004)).add(ee.Number(0.986)).rename('EM');
+
+// Thermal Band (ST_B10)
+var thermal = dataset.select('ST_B10').rename('thermal');
+
+// Calculate Land Surface Temperature (LST)
+var lst = thermal.expression(
+  '(tb / (1 + (0.00115 * (tb / 0.48359547432)) * log(em))) - 273.15',
+  {
+    'tb': thermal.select('thermal'),
+    'em': em
+  }).rename('LST');
+
+// LST Visualization
+var lst_vis = {
+  min: 25,
+  max: 50,
+  palette: [
+    '040274', '040281', '0502a3', '0502b8', '0502ce', '0502e6',
+    '0602ff', '235cb1', '307ef3', '269db1', '30c8e2', '32d3ef',
+    '3be285', '3ff38f', '86e26f', '3ae237', 'b5e22e', 'd6e21f',
+    'fff705', 'ffd611', 'ffb613', 'ff8b13', 'ff6e08', 'ff500d',
+    'ff0000', 'de0101', 'c21301', 'a71001', '911003'
+  ]
+};
+
+// Add LST layer to the map
+Map.addLayer(lst, lst_vis, 'LST AOI');
+Map.centerObject(cebuCity, 10);
+
+
+// ***********************************************************************
+// Urban Heat Island (UHI) Calculation
+// ***********************************************************************
+
+// 1. Calculate the Mean LST (Land Surface Temperature) within the Area of Interest (AOI)
+var lst_mean = ee.Number(lst.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: cebuCity,
+  scale: 30,
+  maxPixels: 1e9
+}).values().get(0));
+
+// 2. Calculate the Standard Deviation of LST within the AOI
+var lst_std = ee.Number(lst.reduceRegion({
+  reducer: ee.Reducer.stdDev(),
+  geometry: cebuCity,
+  scale: 30,
+  maxPixels: 1e9
+}).values().get(0));
+
+// Print the calculated mean and standard deviation values to the console
+print('Mean LST in AOI:', lst_mean);
+print('STD LST in AOI:', lst_std);
+
+// 3. Calculate the Normalized Urban Heat Island (UHI) Index
+var uhi = lst.subtract(lst_mean)  // Subtract the mean LST from each pixel
+  .divide(lst_std)                // Divide by the standard deviation of LST
+  .rename('UHI');                 // Rename the output layer to "UHI"
+
+// 4. Define Visualization Parameters for UHI
+var uhi_vis = {
+  min: -4,                        // Minimum value for UHI (corresponds to cooler areas)
+  max: 4,                         // Maximum value for UHI (corresponds to hotter areas)
+  palette: [                      // Color palette for visualization
+    '313695', '74add1', 'fed976', 'feb24c', 'fd8d3c', 'fc4e2a', 'e31a1c', 'b10026'
+  ]
+};
+
+// 5. Add the UHI layer to the map with specified visualization parameters
+Map.addLayer(uhi, uhi_vis, 'UHI AOI');
+
+
+
+// Urban Thermal Field Variance Index (UTFVI)
+var utfvi = lst.subtract(lst_mean).divide(lst).rename('UTFVI');
+var utfvi_vis = {
+  min: -1,
+  max: 0.3,
+  palette: [
+    '313695', '74add1', 'fed976', 'feb24c', 'fd8d3c', 'fc4e2a', 'e31a1c',
+    'b10026'
+  ]
+};
+Map.addLayer(utfvi, utfvi_vis, 'UTFVI AOI');
+
+// ***********************************************************************
+// Export the layers as GeoTIFFs
+// ***********************************************************************
+
+// Export the True Color Layer (432) as GeoTIFF
+Export.image.toDrive({
+  image: dataset.select(['SR_B4', 'SR_B3', 'SR_B2']),
+  description: 'True_Color_Cebu_2014_March_April',
+  folder: 'UHI_Analysis',
+  scale: 30,
+  region: cebuCity,
+  maxPixels: 1e9
+});
+
+// Export the AOI Polygon as Shapefile
+Export.table.toDrive({
+  collection: cebuCity,
+  description: 'AOI_Polygon_Cebu_2014',
+  folder: 'UHI_Analysis',
+  fileFormat: 'SHP'
+});
+
+
+Export.image.toDrive({
+  image: lst,
+  description: 'LST_Cebu_2014_March_April',
+  folder: 'UHI_Analysis',
+  scale: 30,
+  region: cebuCity,
+  maxPixels: 1e9
+});
+
+Export.image.toDrive({
+  image: ndvi,
+  description: 'NDVI_Cebu_2014_March_April',
+  folder: 'UHI_Analysis',
+  scale: 30,
+  region: cebuCity,
+  maxPixels: 1e9
+});
+
+Export.image.toDrive({
+  image: ndbi,
+  description: 'NDBI_Cebu_2014_March_April',
+  folder: 'UHI_Analysis',
+  scale: 30,
+  region: cebuCity,
+  maxPixels: 1e9
+});
+
+Export.image.toDrive({
+  image: uhi,
+  description: 'UHI_Cebu_2014_March_April',
+  folder: 'UHI_Analysis',
+  scale: 30,
+  region: cebuCity,
+  maxPixels: 1e9
+});
+
+Export.image.toDrive({
+  image: utfvi,
+  description: 'UTFVI_Cebu_2014_March_April',
+  folder: 'UHI_Analysis',
+  scale: 30,
+  region: cebuCity,
+  maxPixels: 1e9
+});
